@@ -28,6 +28,18 @@ class Command(BaseCommand):
     # e.g. "content_manager" → "sites_conformes_core_*".
     APP_RENAMES = {"content_manager": "core"}
 
+    def _table_exists(self, cursor, table_name: str) -> bool:
+        cursor.execute(
+            """
+            SELECT EXISTS (
+                SELECT 1 FROM information_schema.tables
+                WHERE table_schema = 'public' AND table_name = %s
+            );
+            """,
+            [table_name],
+        )
+        return cursor.fetchone()[0]
+
     def _new_app_label(self, app: str) -> str:
         label = self.APP_RENAMES.get(app, app)
         return "sites_conformes_" + label
@@ -52,6 +64,19 @@ class Command(BaseCommand):
         self.stdout.write("=" * 60)
 
         with connection.cursor() as cursor:
+            # Dans le cas où le site est tout neuf, on ne veut pas renommer
+            # les tables. Celles-ci vont être automatiquement créées avec le
+            # préfixe sites_conformes, ce qui n'était pas le cas avant la
+            # v4.0.0 qui a introduit le namespacing de toutes les tables
+            # et applications django.
+            if not self._table_exists(cursor, "django_migrations") or self._table_exists(
+                cursor, "sites_conformes_core_contentpage"
+            ):
+                self.stdout.write(
+                    self.style.SUCCESS("Fresh database — no legacy Sites Faciles schema to migrate, skipping.")
+                )
+                return
+
             table_renames = self._plan_table_renames(cursor)
             migration_updates = self._plan_migration_updates(cursor)
             content_type_updates = self._plan_content_type_updates(cursor)
@@ -88,13 +113,16 @@ class Command(BaseCommand):
 
     def _plan_table_renames(self, cursor) -> list[tuple[str, str]]:
         like_clauses = " OR ".join([f"table_name LIKE '{app}_%'" for app in self.APPS_TO_MIGRATE])
-        cursor.execute(f"""
+        query_template = """
             SELECT table_name
             FROM information_schema.tables
             WHERE table_schema = 'public'
-              AND ({like_clauses})
+              AND ({})
             ORDER BY table_name;
-            """)
+            """
+        # Built from the hardcoded APPS_TO_MIGRATE constant, not user input;
+        # SQL identifiers/literals here can't be parameterized with %s.
+        cursor.execute(query_template.format(like_clauses))  # nosec B608
 
         renames = []
         for (table_name,) in cursor.fetchall():
@@ -112,24 +140,30 @@ class Command(BaseCommand):
 
     def _plan_migration_updates(self, cursor) -> list[tuple[str, str, int]]:
         apps_in_clause = ", ".join([f"'{app}'" for app in self.APPS_TO_MIGRATE])
-        cursor.execute(f"""
+        query_template = """
             SELECT app, COUNT(*) AS migration_count
             FROM django_migrations
-            WHERE app IN ({apps_in_clause})
+            WHERE app IN ({})
             GROUP BY app
             ORDER BY app;
-            """)
+            """
+        # Built from the hardcoded APPS_TO_MIGRATE constant, not user input;
+        # SQL identifiers/literals here can't be parameterized with %s.
+        cursor.execute(query_template.format(apps_in_clause))  # nosec B608
         return [(app, self._new_app_label(app), count) for app, count in cursor.fetchall()]
 
     def _plan_content_type_updates(self, cursor) -> list[tuple[str, str, int]]:
         apps_in_clause = ", ".join([f"'{app}'" for app in self.APPS_TO_MIGRATE])
-        cursor.execute(f"""
+        query_template = """
             SELECT app_label, COUNT(*) AS ct_count
             FROM django_content_type
-            WHERE app_label IN ({apps_in_clause})
+            WHERE app_label IN ({})
             GROUP BY app_label
             ORDER BY app_label;
-            """)
+            """
+        # Built from the hardcoded APPS_TO_MIGRATE constant, not user input;
+        # SQL identifiers/literals here can't be parameterized with %s.
+        cursor.execute(query_template.format(apps_in_clause))  # nosec B608
         return [(app, self._new_app_label(app), count) for app, count in cursor.fetchall()]
 
     # --- Reporting ----------------------------------------------------------
